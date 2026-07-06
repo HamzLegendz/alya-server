@@ -37,7 +37,8 @@ const (
 )
 
 func logf(tag, format string, args ...any) {
-	ts := time.Now().Format("2006-01-02 15:04:05")
+	loc := time.FixedZone("WIB", 7*3600)
+	ts := time.Now().In(loc).Format("2006-01-02 15:04:05 WIB")
 	msg := fmt.Sprintf(format, args...)
 	fmt.Printf("[%s] [%s] %s\n", ts, tag, msg)
 }
@@ -250,6 +251,7 @@ func (h *SecurityHandler) HandleQuit(p *player.Player) {
 	logf(tagQuit, "UUID     : %s", p.UUID())
 	logf(tagQuit, "IP       : %s", ip)
 	logf(tagQuit, "Device   : %s (%s)", deviceModel, deviceOS)
+	logf(tagQuit, "Latency  : %v", p.Latency())
 	logf(tagQuit, "Alasan   : Client Disconnected")
 	separator()
 }
