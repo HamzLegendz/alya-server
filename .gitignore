@@ -1,5 +1,6 @@
-alya-server
+vite-server
 *.log
 world/
 players/
 config.toml
+Vitee.mcworld
