@@ -1,0 +1,5 @@
+alya-server
+*.log
+world/
+players/
+config.toml
