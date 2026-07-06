@@ -251,7 +251,7 @@ func (h *SecurityHandler) HandleQuit(p *player.Player) {
 	logf(tagQuit, "UUID     : %s", p.UUID())
 	logf(tagQuit, "IP       : %s", ip)
 	logf(tagQuit, "Device   : %s (%s)", deviceModel, deviceOS)
-	logf(tagQuit, "Latency  : %v", p.Latency())
+	logf(tagQuit, "Latency  : %d ms", p.Latency().Milliseconds())
 	logf(tagQuit, "Alasan   : Client Disconnected")
 	separator()
 }
@@ -308,7 +308,7 @@ func (PingCommand) Run(src cmd.Source, o *cmd.Output, tx *world.Tx) {
 		o.Error("Hanya bisa dijalankan oleh player.")
 		return
 	}
-	o.Print(fmt.Sprintf("§bPing kamu: §l%v§r§b ke server.", p.Latency()))
+	o.Print(fmt.Sprintf("§bPing kamu: §l%d ms§r§b ke server.", p.Latency().Milliseconds()))
 }
 
 // ─────────────────────────────────────────────

@@ -32,3 +32,5 @@ require (
 )
 
 replace github.com/sandertv/gophertunnel => ../gophertunnel-patched
+
+replace github.com/df-mc/dragonfly => ../dragonfly-patched
