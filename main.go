@@ -4,6 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"math"
+	"net"
+	"net/http"
+	"os"
+	"runtime/debug"
+	"strings"
+	"time"
+
 	"github.com/df-mc/dragonfly/server"
 	"github.com/df-mc/dragonfly/server/block/cube"
 	"github.com/df-mc/dragonfly/server/cmd"
@@ -12,27 +21,46 @@ import (
 	"github.com/df-mc/dragonfly/server/world"
 	"github.com/go-gl/mathgl/mgl64"
 	"github.com/pelletier/go-toml"
-	"log/slog"
-	"math"
-	"net"
-	"net/http"
-	"os"
-	"runtime/debug"
-	"time"
 )
 
-// FilteredHandler filters out benign non-critical world entity loading errors from the console logs
-type FilteredHandler struct {
-	slog.Handler
+// ─────────────────────────────────────────────
+//  LOG HELPERS
+// ─────────────────────────────────────────────
+
+const (
+	tagJoin    = "JOIN"
+	tagQuit    = "QUIT"
+	tagWarn    = "WARN"
+	tagCrash   = "CRASH"
+	tagServer  = "SERVER"
+	tagSecurity = "SECURITY"
+)
+
+func logf(tag, format string, args ...any) {
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	msg := fmt.Sprintf(format, args...)
+	fmt.Printf("[%s] [%s] %s\n", ts, tag, msg)
 }
+
+func separator() {
+	fmt.Println(strings.Repeat("─", 72))
+}
+
+// ─────────────────────────────────────────────
+//  FILTERED SLOG HANDLER
+//  Suppress benign Dragonfly world-load warnings
+// ─────────────────────────────────────────────
+
+type FilteredHandler struct{ slog.Handler }
 
 func (h FilteredHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return h.Handler.Enabled(ctx, level)
 }
 
 func (h FilteredHandler) Handle(ctx context.Context, r slog.Record) error {
-	// Filter out benign entity/block loading warnings that clutter console
-	if r.Message == "read column: unknown entity type" || r.Message == "read column: no block with runtime ID" {
+	switch r.Message {
+	case "read column: unknown entity type",
+		"read column: no block with runtime ID":
 		return nil
 	}
 	return h.Handler.Handle(ctx, r)
@@ -46,76 +74,83 @@ func (h FilteredHandler) WithGroup(name string) slog.Handler {
 	return FilteredHandler{Handler: h.Handler.WithGroup(name)}
 }
 
-// IPInfo holds JSON structure for free IP-API geolocation service
-type IPInfo struct {
-	Status      string `json:"status"`
-	Country     string `json:"country"`
-	RegionName  string `json:"regionName"`
-	City        string `json:"city"`
-	Isp         string `json:"isp"`
+// ─────────────────────────────────────────────
+//  IP GEOLOCATION
+// ─────────────────────────────────────────────
+
+type ipInfo struct {
+	Status     string `json:"status"`
+	Country    string `json:"country"`
+	RegionName string `json:"regionName"`
+	City       string `json:"city"`
+	Isp        string `json:"isp"`
 }
 
-// getIPLocation fetches geographical location details for a given IP address
 func getIPLocation(ip string) string {
 	if ip == "127.0.0.1" || ip == "::1" || ip == "localhost" {
-		return "Localhost (Internal Access)"
+		return "Localhost"
 	}
-
-	// 2 seconds timeout to prevent blocking player join sequences on network delays
-	client := http.Client{
-		Timeout: 2 * time.Second,
-	}
-	resp, err := client.Get("http://ip-api.com/json/" + ip)
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://ip-api.com/json/" + ip + "?fields=status,country,regionName,city,isp")
 	if err != nil {
-		return "Unknown Location (Timeout)"
+		return "Unknown (Timeout)"
 	}
 	defer resp.Body.Close()
 
-	var info IPInfo
+	var info ipInfo
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil || info.Status != "success" {
-		return "Unknown Location (Lookup Failure)"
+		return "Unknown"
 	}
-
-	return fmt.Sprintf("%s, %s, %s (ISP: %s)", info.City, info.RegionName, info.Country, info.Isp)
+	return fmt.Sprintf("%s, %s, %s | ISP: %s", info.City, info.RegionName, info.Country, info.Isp)
 }
 
-// mapOS maps numerical DeviceOS constants to human-readable names
+// ─────────────────────────────────────────────
+//  OS NAME MAPPER
+// ─────────────────────────────────────────────
+
 func mapOS(os int) string {
-	switch os {
-	case 1:
-		return "Android"
-	case 2:
-		return "iOS"
-	case 3:
-		return "macOS"
-	case 4:
-		return "FireOS"
-	case 5:
-		return "GearVR"
-	case 6:
-		return "HoloLens"
-	case 7:
-		return "Windows 10/11"
-	case 8:
-		return "Win32"
-	case 9:
-		return "Dedicated Server"
-	case 10:
-		return "AppleTV"
-	case 11:
-		return "PlayStation"
-	case 12:
-		return "Nintendo Switch"
-	case 13:
-		return "Xbox"
-	case 14:
-		return "Windows Phone"
-	default:
-		return fmt.Sprintf("Unknown (%d)", os)
+	names := map[int]string{
+		1:  "Android",
+		2:  "iOS",
+		3:  "macOS",
+		4:  "FireOS",
+		5:  "GearVR",
+		6:  "HoloLens",
+		7:  "Windows 10/11",
+		8:  "Win32",
+		9:  "Dedicated Server",
+		10: "AppleTV",
+		11: "PlayStation",
+		12: "Nintendo Switch",
+		13: "Xbox",
+		14: "Windows Phone",
 	}
+	if name, ok := names[os]; ok {
+		return name
+	}
+	return fmt.Sprintf("Unknown (%d)", os)
 }
 
-// SecurityHandler implements player events for Anti-Lag, Anti-Cheat, and Anti-Xray protection
+// ─────────────────────────────────────────────
+//  PLAYER IP HELPER
+// ─────────────────────────────────────────────
+
+func playerIP(p *player.Player) string {
+	if p.Addr() == nil {
+		return "N/A"
+	}
+	host, _, err := net.SplitHostPort(p.Addr().String())
+	if err != nil {
+		return p.Addr().String()
+	}
+	return host
+}
+
+// ─────────────────────────────────────────────
+//  SECURITY HANDLER
+//  Anti-Lag · Anti-Cheat · Anti-Xray
+// ─────────────────────────────────────────────
+
 type SecurityHandler struct {
 	player.NopHandler
 	p          *player.Player
@@ -123,183 +158,182 @@ type SecurityHandler struct {
 	oreMined   int
 }
 
-// HandleChat prevents spam messages from lagging the chat and packet queues
+// HandleChat — blokir pesan terlalu panjang (anti-spam/lag)
 func (h *SecurityHandler) HandleChat(ctx *player.Context, message *string) {
 	if len(*message) > 256 {
 		ctx.Cancel()
-		h.p.Message("§c[Anti-Lag] Chat message blocked: too long.")
+		h.p.Message("§c[Anti-Lag] Pesan terlalu panjang, diblokir.")
+		logf(tagSecurity, "Spam chat diblokir | Player: %s | Panjang: %d karakter", h.p.Name(), len(*message))
 	}
 }
 
-// HandleMove rejects movement packets that attempt to teleport or fly at extreme speeds
+// HandleMove — tolak gerakan melampaui batas kecepatan (anti-speed)
 func (h *SecurityHandler) HandleMove(ctx *player.Context, newPos mgl64.Vec3, newRot cube.Rotation) {
 	oldPos := h.p.Position()
 	dx := newPos.X() - oldPos.X()
 	dz := newPos.Z() - oldPos.Z()
-	horizontalDistanceSquared := dx*dx + dz*dz
+	distSq := dx*dx + dz*dz
 
-	// Block any horizontal movement greater than 10 blocks in a single packet (100 distance squared)
-	// unless they are in creative mode or spectator mode.
-	if horizontalDistanceSquared > 100 && !h.p.GameMode().AllowsFlying() {
+	// >10 blok per packet = speed hack (kecuali creative/spectator)
+	if distSq > 100 && !h.p.GameMode().AllowsFlying() {
 		ctx.Cancel()
-		h.p.Message("§c[Anti-Cheat] Movement rejected: speed exceeds threshold.")
+		h.p.Message("§c[Anti-Cheat] Gerakan ditolak: kecepatan melebihi batas.")
+		logf(tagSecurity, "Speed hack terdeteksi | Player: %s | Jarak: %.1f blok", h.p.Name(), math.Sqrt(distSq))
 	}
 }
 
-// HandleAttackEntity prevents players from hitting entities from too far away (Reach Hack)
+// HandleAttackEntity — tolak serangan dari jarak terlalu jauh (anti-reach)
 func (h *SecurityHandler) HandleAttackEntity(ctx *player.Context, e world.Entity, force, height *float64, critical *bool) {
-	playerPos := h.p.Position()
-	entityPos := e.Position()
-	
-	dx := entityPos.X() - playerPos.X()
-	dy := entityPos.Y() - playerPos.Y()
-	dz := entityPos.Z() - playerPos.Z()
-	distanceSquared := dx*dx + dy*dy + dz*dz
-	
-	// Max reach in Bedrock Survival is roughly 4-5 blocks.
-	// 36 distance squared is 6 blocks linear distance.
-	if distanceSquared > 36 && !h.p.GameMode().AllowsFlying() {
+	pp := h.p.Position()
+	ep := e.Position()
+	dx, dy, dz := ep.X()-pp.X(), ep.Y()-pp.Y(), ep.Z()-pp.Z()
+	distSq := dx*dx + dy*dy + dz*dz
+
+	// >6 blok = reach hack
+	if distSq > 36 && !h.p.GameMode().AllowsFlying() {
 		ctx.Cancel()
-		h.p.Message("§c[Anti-Cheat] Attack cancelled: target out of reach.")
-		fmt.Printf("[WARN] Player %s flagged for Reach Hack! Distance: %.2f blocks\n", h.p.Name(), math.Sqrt(distanceSquared))
+		h.p.Message("§c[Anti-Cheat] Serangan dibatalkan: target terlalu jauh.")
+		logf(tagSecurity, "Reach hack terdeteksi | Player: %s | Jarak: %.2f blok", h.p.Name(), math.Sqrt(distSq))
 	}
 }
 
-// HandleBlockBreak implements Anti-Xray checks using mining ratio analysis.
-// IMPORTANT: Do NOT call h.p.Tx() inside any handler — the Tx is closed before handlers fire.
-// We use only stateless ratio tracking which is panic-safe.
+// HandleBlockBreak — anti-xray via rasio ore/block yang ditambang
+// PENTING: Jangan panggil h.p.Tx() di dalam handler — Tx sudah ditutup saat handler dipanggil.
 func (h *SecurityHandler) HandleBlockBreak(ctx *player.Context, pos cube.Pos, drops *[]item.Stack, xp *int) {
-	// We cannot call Tx() here. Instead, count based on what's being mined.
-	// The check is purely ratio-based: if player mines lots of rare ores with very little stone, flag them.
-	
-	// Track stone/common blocks being mined based on position depth heuristic
-	// Depth below Y=16 qualifies as deep mining (potential xray territory)
+	// Hitung blok yang ditambang di kedalaman xray-zone (Y < 16)
 	if pos.Y() < 16 {
 		h.stoneMined++
 	}
 
-	// We can't safely get block name without Tx, so we track xp gain as proxy for ore mining.
-	// Alternatively, use the drops list to detect what was mined.
-	if drops != nil {
-		for _, drop := range *drops {
-			n, _ := drop.Item().EncodeItem()
-			isRareDrop := n == "minecraft:diamond" || n == "minecraft:gold_ore" ||
-				n == "minecraft:emerald" || n == "minecraft:deepslate_diamond_ore" ||
-				n == "minecraft:deepslate_gold_ore" || n == "minecraft:deepslate_emerald_ore"
-			if isRareDrop {
-				h.oreMined++
-				ratio := float64(h.oreMined) / float64(h.stoneMined+1)
-				if h.oreMined > 3 && ratio > 0.4 && !h.p.GameMode().AllowsFlying() {
-					ctx.Cancel()
-					h.p.Message("§c[Anti-Cheat] Suspicious mining pattern detected.")
-					fmt.Printf("[WARN] Player %s flagged: X-ray ratio %.2f (Ores: %d, Depth-blocks: %d)\n",
-						h.p.Name(), ratio, h.oreMined, h.stoneMined)
-				}
-				break
-			}
+	// Deteksi ore dari item drop (safe, tanpa akses Tx)
+	if drops == nil {
+		return
+	}
+	for _, drop := range *drops {
+		n, _ := drop.Item().EncodeItem()
+		isRare := n == "minecraft:diamond" ||
+			n == "minecraft:emerald" ||
+			n == "minecraft:gold_ore" ||
+			n == "minecraft:deepslate_diamond_ore" ||
+			n == "minecraft:deepslate_gold_ore" ||
+			n == "minecraft:deepslate_emerald_ore"
+
+		if !isRare {
+			continue
 		}
+		h.oreMined++
+		ratio := float64(h.oreMined) / float64(h.stoneMined+1)
+		if h.oreMined > 3 && ratio > 0.4 && !h.p.GameMode().AllowsFlying() {
+			ctx.Cancel()
+			h.p.Message("§c[Anti-Cheat] Pola tambang mencurigakan terdeteksi.")
+			logf(tagSecurity, "X-ray terdeteksi | Player: %s | Rasio: %.2f | Ore: %d | Block: %d",
+				h.p.Name(), ratio, h.oreMined, h.stoneMined)
+		}
+		break
 	}
 }
 
-// HandleQuit logs when a player disconnects from the server
+// HandleQuit — log detail saat player keluar
 func (h *SecurityHandler) HandleQuit(p *player.Player) {
-	var deviceOS, deviceModel, ipStr string
-	deviceOS = "Unknown"
-	deviceModel = "Unknown"
+	ip := playerIP(p)
+	deviceOS := "Unknown"
+	deviceModel := "Unknown"
 
-	if p.Addr() != nil {
-		host, _, err := net.SplitHostPort(p.Addr().String())
-		if err == nil {
-			ipStr = host
-		} else {
-			ipStr = p.Addr().String()
-		}
-	}
-
-	// Try to get device info safely
 	if sess := p.Data().Session; sess != nil {
 		cd := sess.ClientData()
 		deviceOS = mapOS(int(cd.DeviceOS))
 		deviceModel = cd.DeviceModel
 	}
 
-	fmt.Printf("[QUIT] Player: %s | IP: %s | Device: %s | OS: %s (Client Disconnected)\n", p.Name(), ipStr, deviceModel, deviceOS)
+	separator()
+	logf(tagQuit, "Player   : %s", p.Name())
+	logf(tagQuit, "UUID     : %s", p.UUID())
+	logf(tagQuit, "IP       : %s", ip)
+	logf(tagQuit, "Device   : %s (%s)", deviceModel, deviceOS)
+	logf(tagQuit, "Alasan   : Client Disconnected")
+	separator()
 }
 
-// Gamemode Command: Changes player's gamemode (Only the Host has permissions to execute)
+// ─────────────────────────────────────────────
+//  COMMANDS
+// ─────────────────────────────────────────────
+
+const hostUUID = "425d83b1-0e0d-4ea0-ab06-e43471711654"
+
+// /gm — ganti gamemode (hanya host)
 type GamemodeCommand struct {
 	Mode string `cmd:"mode"`
 }
+
 func (c GamemodeCommand) Run(src cmd.Source, o *cmd.Output, tx *world.Tx) {
 	p, ok := src.(*player.Player)
 	if !ok {
-		o.Error("This command can only be run by a player.")
+		o.Error("Hanya bisa dijalankan oleh player.")
+		return
+	}
+	if p.UUID().String() != hostUUID {
+		o.Error("Kamu tidak memiliki izin untuk command ini.")
 		return
 	}
 
-	// Security: Restrict command access exclusively to the Host player's UUID
-	if p.UUID().String() != "425d83b1-0e0d-4ea0-ab06-e43471711654" {
-		o.Error("You do not have permission to execute this command.")
-		return
+	modeMap := map[string]int{
+		"survival": 0, "s": 0, "0": 0,
+		"creative": 1, "c": 1, "1": 1,
+		"adventure": 2, "a": 2, "2": 2,
+		"spectator": 3, "sp": 3, "3": 3,
 	}
-
-	var modeID int
-	switch c.Mode {
-	case "survival", "s", "0":
-		modeID = 0
-	case "creative", "c", "1":
-		modeID = 1
-	case "adventure", "a", "2":
-		modeID = 2
-	case "spectator", "sp", "3":
-		modeID = 3
-	default:
-		o.Error("Invalid gamemode! Use survival (s), creative (c), adventure (a), or spectator (sp).")
-		return
-	}
-
-	m, ok := world.GameModeByID(modeID)
+	id, ok := modeMap[strings.ToLower(c.Mode)]
 	if !ok {
-		o.Error("Could not retrieve gamemode.")
+		o.Error("Mode tidak valid. Gunakan: survival (s), creative (c), adventure (a), spectator (sp).")
 		return
 	}
-
+	m, ok := world.GameModeByID(id)
+	if !ok {
+		o.Error("Gagal mengambil gamemode.")
+		return
+	}
 	p.SetGameMode(m)
-	o.Print(fmt.Sprintf("§aYour gamemode has been set to %s.", c.Mode))
+	o.Print(fmt.Sprintf("§aGamemode diubah ke §l%s§r§a.", c.Mode))
+	logf(tagServer, "Gamemode diubah | Player: %s | Mode: %s", p.Name(), c.Mode)
 }
 
-// Ping Command: Checks player's latency (Available to all players)
+// /ping — cek latency
 type PingCommand struct{}
+
 func (PingCommand) Run(src cmd.Source, o *cmd.Output, tx *world.Tx) {
 	p, ok := src.(*player.Player)
 	if !ok {
-		o.Error("This command can only be run by a player.")
+		o.Error("Hanya bisa dijalankan oleh player.")
 		return
 	}
-	latency := p.Latency()
-	o.Print(fmt.Sprintf("§bYour current latency: §l%v", latency))
+	o.Print(fmt.Sprintf("§bPing kamu: §l%v§r§b ke server.", p.Latency()))
 }
 
+// ─────────────────────────────────────────────
+//  MAIN
+// ─────────────────────────────────────────────
+
 func main() {
-	// Anti-Lag: Aggressively collect garbage to keep memory footprint tiny and prevent GC spikes
+	// Anti-Lag: turunkan GC threshold agar memori tetap kecil
 	debug.SetGCPercent(50)
 
-	// Recover from main loop crashes (Anti-Mokad / Server Crash Shield)
+	// Crash Shield: recover panic di main goroutine agar server tidak mati total
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Printf("[CRITICAL CRASH PREVENTED] Server panic recovered: %v\n", r)
+			separator()
+			logf(tagCrash, "PANIC di main goroutine: %v", r)
 			debug.PrintStack()
+			separator()
 		}
 	}()
 
-	// Set up our custom filtered log handler to ignore benign entity warning/errors at LevelWarn
+	// Setup filtered logger — sembunyikan warning Dragonfly yang tidak kritis
 	baseHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})
-	logger := slog.New(FilteredHandler{Handler: baseHandler})
-	slog.SetDefault(logger)
+	slog.SetDefault(slog.New(FilteredHandler{Handler: baseHandler}))
 
-	// Register custom commands (No cheat commands like /heal, maintaining hard survival integrity)
-	cmd.Register(cmd.New("gm", "Change your gamemode", nil, GamemodeCommand{}))
-	cmd.Register(cmd.New("ping", "Check your latency to the server", nil, PingCommand{}))
+	// Daftarkan command
+	cmd.Register(cmd.New("gm", "Ubah gamemode (host only)", nil, GamemodeCommand{}))
+	cmd.Register(cmd.New("ping", "Cek latency kamu ke server", nil, PingCommand{}))
 
 	conf, err := readConfig(slog.Default())
 	if err != nil {
@@ -309,92 +343,101 @@ func main() {
 	srv := conf.New()
 	srv.CloseOnProgramEnd()
 
-	// Enforce World Difficulty to Hard (3) on Server Side
+	// Paksa difficulty Hard & spawn point
 	srv.World().SetDifficulty(world.DifficultyHard)
-
-	// Set default spawn point in the world (X=82, Y=30, Z=237)
 	srv.World().SetSpawn(cube.Pos{82, 30, 237})
 
-	fmt.Println("Starting Dragonfly server on port 19132...")
+	separator()
+	logf(tagServer, "Vite Minecraft Server dimulai")
+	logf(tagServer, "Port    : 19132 (UDP)")
+	logf(tagServer, "Mode    : Hard Survival")
+	logf(tagServer, "Spawn   : X=82, Y=30, Z=237")
+	separator()
+
 	srv.Listen()
-	
+
 	for p := range srv.Accept() {
-		// Recover individual player goroutine panic crashes to keep other players online (Anti-Mokad)
-		go func(playerObj *player.Player) {
-			defer func() {
-				if r := recover(); r != nil {
-					fmt.Printf("[CRITICAL ERROR] Recovered player %s goroutine panic: %v\n", playerObj.Name(), r)
-					debug.PrintStack()
-				}
-			}()
-
-			// Retrieve client information from the player session config data
-			sess := playerObj.Data().Session
-			var deviceOS, deviceModel, gameVersion, ipStr, ipLocation string
-			if sess != nil {
-				cd := sess.ClientData()
-				deviceOS = mapOS(int(cd.DeviceOS))
-				deviceModel = cd.DeviceModel
-				gameVersion = cd.GameVersion
-			}
-			if playerObj.Addr() != nil {
-				host, _, err := net.SplitHostPort(playerObj.Addr().String())
-				if err == nil {
-					ipStr = host
-				} else {
-					ipStr = playerObj.Addr().String()
-				}
-				// Fetch IP Geolocation dynamically (Simple & Detailed)
-				ipLocation = getIPLocation(ipStr)
-			}
-
-			// Log player join with detailed client parameters (capturable in PM2 logs)
-			fmt.Printf("[JOIN] Player: %s | UUID: %s | IP: %s (%s) | Device: %s | OS: %s | Game Version: %s\n",
-				playerObj.Name(), playerObj.UUID(), ipStr, ipLocation, deviceModel, deviceOS, gameVersion)
-
-			// Small delay to ensure client is fully initialized before sending game rules
-			time.Sleep(500 * time.Millisecond)
-
-			// Enable Vanilla coordinates display for the client (public API - safe)
-			playerObj.ShowCoordinates()
-
-			// SetDifficulty is enforced world-wide above (srv.World().SetDifficulty(world.DifficultyHard))
-			// showdaysplayed requires internal packet API - not accessible externally in Dragonfly v0.10
-
-			// Set our custom anti-lag, anti-cheat, and anti-xray handler
-			playerObj.Handle(&SecurityHandler{p: playerObj})
-		}(p)
+		go handlePlayer(p)
 	}
 }
 
-// readConfig reads the configuration from the config.toml file, or creates the
-// file if it does not yet exist.
+// handlePlayer menangani event satu player secara goroutine terpisah
+func handlePlayer(p *player.Player) {
+	// Crash Shield per-player — player lain tetap online jika satu goroutine panic
+	defer func() {
+		if r := recover(); r != nil {
+			separator()
+			logf(tagCrash, "PANIC goroutine player [%s]: %v", p.Name(), r)
+			debug.PrintStack()
+			separator()
+		}
+	}()
+
+	// Ambil info client
+	var deviceOS, deviceModel, gameVersion string
+	if sess := p.Data().Session; sess != nil {
+		cd := sess.ClientData()
+		deviceOS = mapOS(int(cd.DeviceOS))
+		deviceModel = cd.DeviceModel
+		gameVersion = cd.GameVersion
+	}
+
+	ip := playerIP(p)
+
+	// Fetch lokasi IP secara async sudah di goroutine ini, tidak memblokir server
+	location := getIPLocation(ip)
+
+	// Log JOIN detail
+	separator()
+	logf(tagJoin, "Player   : %s", p.Name())
+	logf(tagJoin, "UUID     : %s", p.UUID())
+	logf(tagJoin, "IP       : %s", ip)
+	logf(tagJoin, "Lokasi   : %s", location)
+	logf(tagJoin, "Device   : %s (%s)", deviceModel, deviceOS)
+	logf(tagJoin, "Versi MC : %s", gameVersion)
+	separator()
+
+	// Delay kecil agar client siap menerima packet game rule
+	time.Sleep(500 * time.Millisecond)
+
+	// Aktifkan koordinat HUD
+	p.ShowCoordinates()
+
+	// Pasang security handler (anti-cheat, anti-lag, anti-xray)
+	p.Handle(&SecurityHandler{p: p})
+}
+
+// ─────────────────────────────────────────────
+//  CONFIG READER
+// ─────────────────────────────────────────────
+
 func readConfig(log *slog.Logger) (server.Config, error) {
 	c := server.DefaultConfig()
 	var zero server.Config
+
 	if _, err := os.Stat("config.toml"); os.IsNotExist(err) {
-		// Configure optimized defaults
 		c.Server.Name = "Vite"
 		c.Players.MaxCount = 10
 		c.Network.Address = "0.0.0.0:19132"
 		c.World.Folder = "world"
 		c.Players.Folder = "players"
 		c.Players.MaximumChunkRadius = 8
-		
+
 		data, err := toml.Marshal(c)
 		if err != nil {
-			return zero, fmt.Errorf("failed encoding default config: %w", err)
+			return zero, fmt.Errorf("gagal encode config: %w", err)
 		}
 		if err := os.WriteFile("config.toml", data, 0644); err != nil {
-			return zero, fmt.Errorf("failed creating config: %w", err)
+			return zero, fmt.Errorf("gagal tulis config: %w", err)
 		}
 	}
+
 	data, err := os.ReadFile("config.toml")
 	if err != nil {
-		return zero, fmt.Errorf("failed reading config: %w", err)
+		return zero, fmt.Errorf("gagal baca config: %w", err)
 	}
 	if err := toml.Unmarshal(data, &c); err != nil {
-		return zero, fmt.Errorf("failed decoding config: %w", err)
+		return zero, fmt.Errorf("gagal decode config: %w", err)
 	}
 	return c.Config(log)
 }
